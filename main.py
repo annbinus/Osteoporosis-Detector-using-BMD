@@ -25,3 +25,31 @@ dxa = replace_sentinel(dxa)
 demo = replace_sentinel(demo)
 dxa = dxa[dxa['DXAEXSTS'] == 1].copy()
 print(f'Valid DXA rows: {len(dxa)}')
+
+
+# 'RIAGENDR' - Gender, 'RIDAGEYR' - Age, 'RIDRETH3' - Race
+demo_cols = ['SEQN', 'RIAGENDR', 'RIDAGEYR', 'RIDRETH3']
+df = pd.merge(dxa, demo[demo_cols], on='SEQN', how='inner')
+df = df[df['RIDAGEYR'] >= 20].copy()
+print(f'Merged rows: {len(df)}')
+
+reference_pop = df[
+    (df['RIDAGEYR'] >= 20) & 
+    (df['RIDAGEYR'] < 30) &
+    (df['DXDTOBMD'].notna())
+].copy()
+
+# Derive reference mean and SD for each gender and age group.
+
+derived_ref = {}
+for sex_code, sex_label in [(1, 'Male'), (2, 'Female')]:
+    sex_data = reference_pop[reference_pop['RIAGENDR'] == sex_code]['DXDTOBMD']
+    mean_val = sex_data.mean()
+    sd_val   = sex_data.std()
+    # Same reference mean/SD applies to all age groups (that's how T-score works)
+    for age_group in ['20-29','30-39','40-49','50-59','60-69','70+']:
+        derived_ref[(sex_code, age_group)] = (mean_val, sd_val)
+
+print("\nDerived NHANES_REF:")
+for key, val in derived_ref.items():
+    print(f"  {key}: ({val[0]:.4f}, {val[1]:.4f})")
