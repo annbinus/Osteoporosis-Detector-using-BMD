@@ -6,69 +6,96 @@ from sklearn.impute import SimpleImputer
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 from sklearn.model_selection import cross_val_score
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc, roc_auc_score
+from sklearn.preprocessing import label_binarize
+import joblib, os, tarfile
 import boto3
 
 
 BUCKET = 'osteo-s3-demo-bucket'
-DXA = 'dxa.csv'
-DEMOGRAPHICS = 'demo.csv'
 
 s3 = boto3.client('s3')
-s3.download_file(BUCKET, DXA, '/tmp/dxa.csv')
-s3.download_file(BUCKET, DEMOGRAPHICS, '/tmp/demo.csv')
 
-dxa = pd.read_csv('/tmp/dxa.csv')
-demo = pd.read_csv('/tmp/demo.csv')
-
-print(f'DXA rows: {len(dxa)}, DEMO rows: {len(demo)}')
+CYCLES = {
+    '1999-2000': {'dxa': '1999-2000/DXX 1999-2000.csv', 'demo': '1999-2000/DEMO 1999-2000.csv'},
+    '2001-2002': {'dxa': '2001-2002/DXX 2001-02.csv', 'demo': '2001-2002/DEMO 2001-02.csv'},
+    '2003-2004': {'dxa': '2003-2004/DXX 2003-04.csv', 'demo': '2003-2004/DEMO 2003-04.csv'},
+    '2005-2006': {'dxa': '2005-2006/DXX 2005-06.csv', 'demo': '2005-2006/DEMO 2005-06.csv'},
+    '2020':      {'dxa': '2020/DXA 2020.csv',      'demo': '2020/DEMO 2020.csv'},
+}
 
 sentinel = 5.397605346934028e-79
 
 def replace_sentinel(df):
     return df.replace(sentinel, np.nan).where(df.abs() > 1e-70, other=np.nan)
 
-dxa = replace_sentinel(dxa)
-demo = replace_sentinel(demo)
-dxa = dxa[dxa['DXAEXSTS'] == 1].copy()
-print(f'Valid DXA rows: {len(dxa)}')
+dfs = []
+
+for cycle, paths in CYCLES.items():
+
+    # Download from S3 → local temp files
+    dxa_path = f'/tmp/dxa_{cycle}.xpt'
+    demo_path = f'/tmp/demo_{cycle}.xpt'
+
+    s3.download_file(BUCKET, paths['dxa'], dxa_path)
+    s3.download_file(BUCKET, paths['demo'], demo_path)
+
+    dxa = pd.read_csv(dxa_path)
+    demo = pd.read_csv(demo_path)
+
+    dxa = replace_sentinel(dxa)
+    demo = replace_sentinel(demo)  
+
+    dxa = dxa[dxa['DXAEXSTS'] == 1].copy()
+    eth_col = 'RIDRETH3' if 'RIDRETH3' in demo.columns else 'RIDRETH1'
+    merged = pd.merge(dxa, demo[['SEQN', 'RIAGENDR', 'RIDAGEYR', eth_col]], on='SEQN', how='inner')
+
+    merged['CYCLE'] = cycle
+    merged = merged.rename(columns={eth_col: 'RIDRETH3'})
+    dfs.append(merged)
+
+    print(f'  {cycle}: {len(merged)} valid records')
+
+df_all = pd.concat(dfs, ignore_index=True)
+print(f"Total records: {len(df_all)}")
 
 
-# 'RIAGENDR' - Gender, 'RIDAGEYR' - Age, 'RIDRETH3' - Race
-demo_cols = ['SEQN', 'RIAGENDR', 'RIDAGEYR', 'RIDRETH3']
-df = pd.merge(dxa, demo[demo_cols], on='SEQN', how='inner')
-df = df[df['RIDAGEYR'] >= 20].copy()
-print(f'Merged rows: {len(df)}')
+df = df_all[df_all['RIDAGEYR'] >= 50].copy()
+print(f'Adults 50+: {len(df)}')
+print(f"Sex: {df['RIAGENDR'].value_counts().rename({1:'Male', 2:'Female'}).to_dict()}")
+print(f"Age range: {df['RIDAGEYR'].min():.0f} - {df['RIDAGEYR'].max():.0f}")
 
-reference_pop = df[
-    (df['RIDAGEYR'] >= 20) & 
-    (df['RIDAGEYR'] < 30) &
-    (df['DXDTOBMD'].notna())
+reference_pop = df_all[
+    (df_all['RIDAGEYR'] >= 20) & 
+    (df_all['RIDAGEYR'] < 30) &
+    (df_all['DXDTOBMD'].notna())
 ].copy()
+
+# Calculate mean and SD by sex
+ref_values = (
+    reference_pop
+    .groupby('RIAGENDR')['DXDTOBMD']
+    .agg(mean_bmd='mean', sd_bmd='std')
+)
+print('\nDerived reference values:')
+print(ref_values.round(4))
 
 # Derive reference mean and SD for each gender and age group.
 
 derived_ref = {}
-for gender_code, gender_label in [(1, 'Male'), (2, 'Female')]:
-    gender_data = reference_pop[reference_pop['RIAGENDR'] == gender_code]['DXDTOBMD']
-    mean_val = gender_data.mean()
-    sd_val   = gender_data.std()
-    # Same reference mean/SD applies to all age groups 
-    for age_group in ['20-29','30-39','40-49','50-59','60-69','70+']:
+for gender_code in [1, 2]:
+    mean_val = ref_values.loc[gender_code, 'mean_bmd']
+    sd_val   = ref_values.loc[gender_code, 'sd_bmd']
+    for age_group in ['50-59', '60-69', '70+']:
         derived_ref[(gender_code, age_group)] = (mean_val, sd_val)
 
-print("\nDerived NHANES_REF:")
+print('\nDerived NHANES_REF:')
 for key, val in derived_ref.items():
-    print(f"  {key}: ({val[0]:.4f}, {val[1]:.4f})")
+    print(f'  {key}: ({val[0]:.4f}, {val[1]:.4f})')
 
 
 def get_age_group(age):
-    if age < 30:
-        return '20-29'
-    elif age < 40:
-        return '30-39'
-    elif age < 50:
-        return '40-49'
-    elif age < 60:
+    if age < 60:
         return '50-59'
     elif age < 70:
         return '60-69'
@@ -76,7 +103,7 @@ def get_age_group(age):
         return '70+'
     
 def compute_t_score(row):
-    gender, age, bmd = row['RIAGENDR'], row['RIDAGEYR'], row['DXDTOBMD']
+    gender, age, bmd = row['RIAGENDR'], row['RIDAGEYR'], row['DXXLSBMD']
     if pd.isna(bmd) or pd.isna(age) or pd.isna(gender):
         return np.nan
     key = (int(gender), get_age_group(age))
@@ -126,9 +153,6 @@ plt.show()
 # BMD features
 
 bmd_cols = [
-    'DXDTOBMD',   # Total body
-    'DXDSTBMD',   # Subtotal
-    'DXXLSBMD',   # Lumbar spine ← most important
     'DXXPEBMD',   # Pelvis
     'DXXTSBMD',   # Thoracic spine
     'DXXLRBMD',   # Left rib
@@ -144,9 +168,6 @@ bmd_cols = [
 # BMC features
 
 bmc_cols = [
-    'DXDTOBMC',   # Total body
-    'DXDSTBMC',   # Subtotal
-    'DXXLSBMC',   # Lumbar spine
     'DXXPEBMC',   # Pelvis
 ]
 
@@ -199,10 +220,76 @@ model = XGBClassifier(
     subsample=0.8,
     colsample_bytree=0.8,
     random_state=50,
-    eval_metric='mlogloss'
+    eval_metric='logloss'
 )
 
 cv_scores = cross_val_score(model, X_train_bal, y_train_bal, cv=5, scoring='f1_macro')
 print(f'CV F1 Macro Scores: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}')
 
 model.fit(X_train_bal, y_train_bal)
+
+y_pred = model.predict(X_test_imp)
+y_proba = model.predict_proba(X_test_imp)
+print(classification_report(y_test, y_pred, target_names=label_map.values()))
+print(f'ROC AUC: {roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro"):.4f}')
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+
+cm = confusion_matrix(y_test, y_pred)
+ConfusionMatrixDisplay(cm, display_labels=label_map.values()).plot(ax=axes[0], colorbar=False, cmap='Blues')
+axes[0].set_title('Confusion Matrix', fontsize=14)
+
+y_test_bin = label_binarize(y_test, classes=[0, 1, 2])
+colors = ['#2ecc71', '#f39c12', '#e74c3c']
+labels = ['Normal', 'Osteopenia', 'Osteoporosis']
+
+for i, (color, label) in enumerate(zip(colors, labels)):
+    fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_proba[:, i])
+    axes[1].plot(fpr, tpr, color=color, label=f'{label} (AUC={auc(fpr,tpr):.2f})')
+
+axes[1].plot([0, 1], [0, 1], 'k--')
+axes[1].set_xlabel('False Positive Rate')
+axes[1].set_ylabel('True Positive Rate')
+axes[1].set_title('ROC Curve (One vs Rest)', fontsize=14)
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig('/tmp/model_evaluation.png', dpi=150)
+s3.upload_file('/tmp/model_evaluation.png', BUCKET, 'outputs/model_evaluation.png')
+plt.show()
+
+importance_df = pd.DataFrame({
+    'feature':    feature_cols,
+    'importance': model.feature_importances_
+}).sort_values('importance').tail(15)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+ax.barh(importance_df['feature'], importance_df['importance'], color='#3498db')
+ax.set_title('Top 15 Feature Importances', fontsize=14)
+ax.set_xlabel('Importance')
+plt.tight_layout()
+plt.savefig('/tmp/feature_importance.png', dpi=150)
+boto3.client('s3').upload_file('/tmp/feature_importance.png', BUCKET, 'outputs/feature_importance.png')
+plt.show()
+
+
+os.makedirs('/tmp/model', exist_ok=True)
+joblib.dump(model,        '/tmp/model/model.joblib')
+joblib.dump(imputer,      '/tmp/model/imputer.joblib')
+joblib.dump(feature_cols, '/tmp/model/feature_cols.joblib')
+
+with tarfile.open('/tmp/model.tar.gz', 'w:gz') as tar:
+    for fname in ['model.joblib', 'imputer.joblib', 'feature_cols.joblib']:
+        tar.add(f'/tmp/model/{fname}', arcname=fname)
+
+boto3.client('s3').upload_file('/tmp/model.tar.gz', BUCKET, 'models/model.tar.gz')
+print('Model saved to s3://osteo-s3-demo-bucket/models/model.tar.gz')
+
+
+boto3.client('s3').upload_file(
+    '/tmp/model.tar.gz',
+    BUCKET,
+    'models/model.tar.gz'
+)
+print(f'Uploaded to s3://{BUCKET}/models/model.tar.gz')
