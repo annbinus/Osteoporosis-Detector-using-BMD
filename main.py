@@ -8,8 +8,8 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc, roc_auc_score
 from sklearn.preprocessing import label_binarize
-import joblib, os, tarfile
-import boto3
+import joblib, os, tarfile, shutil
+import boto3, json
 
 
 BUCKET = 'osteo-s3-demo-bucket'
@@ -279,17 +279,14 @@ joblib.dump(model,        '/tmp/model/model.joblib')
 joblib.dump(imputer,      '/tmp/model/imputer.joblib')
 joblib.dump(feature_cols, '/tmp/model/feature_cols.joblib')
 
+shutil.copy('inference.py', '/tmp/model/inference.py')
+
 with tarfile.open('/tmp/model.tar.gz', 'w:gz') as tar:
-    for fname in ['model.joblib', 'imputer.joblib', 'feature_cols.joblib']:
+    for fname in ['model.joblib', 'imputer.joblib', 'feature_cols.joblib', 'inference.py']:
         tar.add(f'/tmp/model/{fname}', arcname=fname)
 
 boto3.client('s3').upload_file('/tmp/model.tar.gz', BUCKET, 'models/model.tar.gz')
 print('Model saved to s3://osteo-s3-demo-bucket/models/model.tar.gz')
 
+client = boto3.client('sagemaker-runtime', region_name='us-east-1')
 
-boto3.client('s3').upload_file(
-    '/tmp/model.tar.gz',
-    BUCKET,
-    'models/model.tar.gz'
-)
-print(f'Uploaded to s3://{BUCKET}/models/model.tar.gz')

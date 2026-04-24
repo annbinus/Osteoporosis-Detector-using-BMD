@@ -1,0 +1,8 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+venv/
+venv/
+venv310/
+venv311/
+__pycache__/
+*.pyc
+.DS_Store
